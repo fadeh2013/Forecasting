@@ -1,0 +1,354 @@
+library(shiny)
+library(quantmod)
+library(forecast)
+library(prophet)
+library(plotly)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+
+# Predefined stock symbols
+BUILTIN_STOCKS <- c(
+  "Apple (AAPL)" = "AAPL",
+  "Microsoft (MSFT)" = "MSFT",
+  "Google (GOOGL)" = "GOOGL",
+  "Amazon (AMZN)" = "AMZN",
+  "Tesla (TSLA)" = "TSLA"
+)
+
+ui <- fluidPage(
+  titlePanel("📈 Stock Forecasting with Confidence Intervals"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      h4("📊 Data Source"),
+      radioButtons("data_source", NULL,
+                   choices = c("Built-in Stocks" = "builtin", "Upload CSV" = "upload"),
+                   selected = "builtin"),
+      
+      conditionalPanel(
+        condition = "input.data_source == 'builtin'",
+        selectInput("stock_symbol", "Select Stock:", choices = BUILTIN_STOCKS, selected = "AAPL"),
+        dateRangeInput("dates", "Date Range:",
+                       start = Sys.Date() - 365,
+                       end = Sys.Date())
+      ),
+      
+      conditionalPanel(
+        condition = "input.data_source == 'upload'",
+        fileInput("file", "Upload CSV File", accept = c(".csv")),
+        helpText("Must have columns: 'Date' (YYYY-MM-DD) and 'Price' (numeric).")
+      ),
+      
+      hr(),
+      h4("⚙️ Forecast Settings"),
+      numericInput("horizon", "Forecast Horizon (trading days):", value = 30, min = 1, max = 180),
+      
+      h4("🧠 Forecast Models"),
+      checkboxGroupInput("models", "Select Models:",
+                         choices = c(
+                           "ARIMA" = "arima",
+                           "ETS" = "ets",
+                           "Prophet" = "prophet",
+                           "Simple Moving Average (SMA)" = "sma"
+                         ),
+                         selected = c("arima", "ets")),
+      
+      actionButton("run_forecast", "Run Forecast", class = "btn-primary", width = "100%"),
+      br(), br(),
+      helpText("💡 Confidence intervals: 80% (dark) and 95% (light).")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Forecast Plot", plotlyOutput("forecast_plot", height = "600px")),
+        tabPanel("Model Comparison", tableOutput("model_table")),
+        tabPanel("Data Preview", tableOutput("data_preview")),
+        tabPanel("Residual Diagnostics", plotOutput("resid_plot", height = "500px"))
+      )
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  stock_data <- reactive({
+    req(input$run_forecast)
+    
+    if (input$data_source == "builtin") {
+      symbol <- input$stock_symbol
+      start_date <- as.Date(input$dates[1])
+      end_date <- as.Date(input$dates[2])
+      
+      tryCatch({
+        stock_xts <- getSymbols(symbol, src = "yahoo", from = start_date, to = end_date, auto.assign = FALSE)
+        if (nrow(stock_xts) == 0) {
+          showNotification("No data found.", type = "error")
+          return(NULL)
+        }
+        
+        df <- data.frame(
+          Date = index(stock_xts),
+          Price = as.numeric(Ad(stock_xts)),
+          row.names = NULL
+        ) %>%
+          filter(!is.na(Price))
+        
+        if (nrow(df) < 10) {
+          showNotification("Not enough data points (<10).", type = "error")
+          return(NULL)
+        }
+        df
+      }, error = function(e) {
+        showNotification(paste("Error loading", symbol, ":", e$message), type = "error")
+        return(NULL)
+      })
+      
+    } else {
+      req(input$file)
+      tryCatch({
+        df <- read_csv(input$file$datapath, col_types = cols()) %>%
+          select(Date, Price) %>%
+          mutate(Date = ymd(Date)) %>%
+          arrange(Date) %>%
+          filter(!is.na(Price))
+        
+        if (nrow(df) < 10) {
+          showNotification("Upload requires ≥10 valid points.", type = "error")
+          return(NULL)
+        }
+        df
+      }, error = function(e) {
+        showNotification("Invalid file format.", type = "error")
+        return(NULL)
+      })
+    }
+  })
+  
+  forecast_results <- eventReactive(input$run_forecast, {
+    df <- stock_data()
+    if (is.null(df)) return(NULL)
+    
+    horizon <- input$horizon
+    models_to_run <- input$models
+    if (is.null(models_to_run) || length(models_to_run) == 0) {
+      showNotification("Select at least one model.", type = "warning")
+      return(NULL)
+    }
+    
+    ts_data <- ts(df$Price, frequency = 252)
+    results <- list()
+    model_info <- data.frame(Model = character(), AIC = numeric(), MAE = numeric(), stringsAsFactors = FALSE)
+    
+    # ARIMA
+    if ("arima" %in% models_to_run) {
+      fit <- auto.arima(ts_data, stepwise = TRUE, approximation = TRUE)
+      fc <- forecast(fit, h = horizon, level = c(80, 95))
+      results[["ARIMA"]] <- fc
+      model_info <- rbind(model_info, data.frame(
+        Model = "ARIMA", AIC = round(AIC(fit), 2), MAE = round(mean(abs(residuals(fit))), 4)
+      ))
+    }
+    
+    # ETS
+    if ("ets" %in% models_to_run) {
+      fit <- ets(ts_data)
+      fc <- forecast(fit, h = horizon, level = c(80, 95))
+      results[["ETS"]] <- fc
+      model_info <- rbind(model_info, data.frame(
+        Model = "ETS", AIC = round(AIC(fit), 2), MAE = round(mean(abs(residuals(fit))), 4)
+      ))
+    }
+    
+    # Prophet
+    if ("prophet" %in% models_to_run) {
+      prophet_df <- df %>% rename(ds = Date, y = Price)
+      m <- prophet(prophet_df, yearly.seasonality = TRUE, weekly.seasonality = TRUE)
+      future <- make_future_dataframe(m, periods = horizon)
+      fc_prophet <- predict(m, future)
+      # Prophet uses 80% and 95% by default in yhat_upper/yhat_lower
+      results[["Prophet"]] <- list(fit = m, forecast = fc_prophet)
+    }
+    
+    # SMA
+    if ("sma" %in% models_to_run) {
+      last_price <- tail(df$Price, 1)
+      sma_forecast <- rep(last_price, horizon)
+      results[["SMA"]] <- list(mean = sma_forecast)
+    }
+    
+    list(forecasts = results, data = df, model_info = model_info)
+  })
+  
+  # Forecast plot with confidence intervals
+  output$forecast_plot <- renderPlotly({
+    res <- forecast_results()
+    if (is.null(res)) return(NULL)
+    
+    # Generate future trading days (Mon-Fri)
+    last_date <- tail(res$data$Date, 1)
+    future_dates <- seq(last_date + 1, by = "day", length.out = input$horizon * 2)
+    future_dates <- future_dates[weekdays(future_dates) %in% c("Monday","Tuesday","Wednesday","Thursday","Friday")]
+    future_dates <- future_dates[1:input$horizon]
+    
+    p <- plot_ly() %>%
+      add_trace(
+        x = res$data$Date,
+        y = res$data$Price,
+        type = 'scatter',
+        mode = 'lines',
+        name = 'Historical',
+        line = list(color = 'black', width = 2),
+        hoverinfo = 'text',
+        text = paste("Date:", res$data$Date, "<br>Price:", round(res$data$Price, 2))
+      )
+    
+    for (model_name in names(res$forecasts)) {
+      fc <- res$forecasts[[model_name]]
+      
+      if (model_name == "Prophet") {
+        prophet_fc <- tail(fc$forecast, input$horizon)
+        p <- p %>%
+          # 95% CI
+          add_trace(
+            x = c(prophet_fc$ds, rev(prophet_fc$ds)),
+            y = c(prophet_fc$yhat_lower, rev(prophet_fc$yhat_upper)),
+            type = 'scatter',
+            mode = 'none',
+            fill = 'toself',
+            fillcolor = 'rgba(255, 127, 14, 0.2)',
+            showlegend = FALSE,
+            hoverinfo = 'skip'
+          ) %>%
+          # 80% CI (overwrite with darker band)
+          add_trace(
+            x = c(prophet_fc$ds, rev(prophet_fc$ds)),
+            y = c(prophet_fc$yhat_lower, rev(prophet_fc$yhat_upper)),
+            type = 'scatter',
+            mode = 'none',
+            fill = 'toself',
+            fillcolor = 'rgba(255, 127, 14, 0.4)',
+            showlegend = FALSE,
+            hoverinfo = 'skip'
+          ) %>%
+          # Point forecast
+          add_trace(
+            x = prophet_fc$ds,
+            y = prophet_fc$yhat,
+            type = 'scatter',
+            mode = 'lines',
+            name = 'Prophet',
+            line = list(dash = 'dot', color = '#FF7F0E'),
+            hoverinfo = 'text',
+            text = paste(
+              "Date:", prophet_fc$ds, "<br>",
+              "Forecast:", round(prophet_fc$yhat, 2), "<br>",
+              "80% CI: [", round(prophet_fc$yhat_lower, 2), ", ", round(prophet_fc$yhat_upper, 2), "]"
+            )
+          )
+        
+      } else if (model_name == "SMA") {
+        p <- p %>%
+          add_trace(
+            x = future_dates[1:length(fc$mean)],
+            y = fc$mean,
+            type = 'scatter',
+            mode = 'lines',
+            name = 'SMA',
+            line = list(dash = 'dot', color = '#2CA02C'),
+            hoverinfo = 'text',
+            text = paste("Date:", future_dates[1:length(fc$mean)], "<br>Forecast:", round(fc$mean, 2))
+          )
+        
+      } else {
+        # ARIMA or ETS
+        n_forecast <- length(fc$mean)
+        dates_used <- future_dates[1:n_forecast]
+        
+        # 95% CI
+        p <- p %>%
+          add_trace(
+            x = c(dates_used, rev(dates_used)),
+            y = c(fc$lower[,2], rev(fc$upper[,2])),
+            type = 'scatter',
+            mode = 'none',
+            fill = 'toself',
+            fillcolor = ifelse(model_name == "ARIMA", 'rgba(31, 119, 180, 0.2)', 'rgba(44, 160, 44, 0.2)'),
+            showlegend = FALSE,
+            hoverinfo = 'skip'
+          ) %>%
+          # 80% CI
+          add_trace(
+            x = c(dates_used, rev(dates_used)),
+            y = c(fc$lower[,1], rev(fc$upper[,1])),
+            type = 'scatter',
+            mode = 'none',
+            fill = 'toself',
+            fillcolor = ifelse(model_name == "ARIMA", 'rgba(31, 119, 180, 0.4)', 'rgba(44, 160, 44, 0.4)'),
+            showlegend = FALSE,
+            hoverinfo = 'skip'
+          ) %>%
+          # Point forecast
+          add_trace(
+            x = dates_used,
+            y = fc$mean,
+            type = 'scatter',
+            mode = 'lines',
+            name = model_name,
+            line = list(
+              dash = 'dot',
+              color = ifelse(model_name == "ARIMA", '#1F77B4', '#2CA02C')
+            ),
+            hoverinfo = 'text',
+            text = paste(
+              "Date:", dates_used, "<br>",
+              "Forecast:", round(fc$mean, 2), "<br>",
+              "80% CI: [", round(fc$lower[,1], 2), ", ", round(fc$upper[,1], 2), "]<br>",
+              "95% CI: [", round(fc$lower[,2], 2), ", ", round(fc$upper[,2], 2), "]"
+            )
+          )
+      }
+    }
+    
+    p %>% layout(
+      title = if (input$data_source == "builtin") 
+        paste("Forecast for", names(BUILTIN_STOCKS)[BUILTIN_STOCKS == input$stock_symbol])
+      else "Forecast (Uploaded Data)",
+      xaxis = list(title = "Date"),
+      yaxis = list(title = "Adjusted Close Price"),
+      hovermode = "x unified",
+      legend = list(x = 0.01, y = 0.99)
+    )
+  })
+  
+  output$model_table <- renderTable({
+    res <- forecast_results()
+    if (is.null(res) || nrow(res$model_info) == 0) return(NULL)
+    res$model_info
+  }, rownames = FALSE)
+  
+  output$data_preview <- renderTable({
+    df <- stock_data()
+    if (is.null(df)) return(NULL)
+    head(df, 10)
+  })
+  
+  output$resid_plot <- renderPlot({
+    res <- forecast_results()
+    if (is.null(res)) return(NULL)
+    
+    model_fit <- NULL
+    if (!is.null(res$forecasts$ARIMA)) {
+      model_fit <- res$forecasts$ARIMA
+    } else if (!is.null(res$forecasts$ETS)) {
+      model_fit <- res$forecasts$ETS
+    }
+    if (is.null(model_fit)) return(NULL)
+    
+    par(mar = c(4,4,2,1))
+    forecast::ggtsdisplay(residuals(model_fit), main = "Residual Diagnostics")
+  })
+}
+
+shinyApp(ui = ui, server = server)
